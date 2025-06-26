@@ -8,7 +8,7 @@ export interface GitHubSyncSettings {
   syncInterval: number;
   syncOnStartup: boolean;
   syncConfigDir: boolean;
-  conflictHandling: "overwriteLocal" | "ask" | "overwriteRemote";
+  conflictHandling: "overwriteLocal" | "ask" | "askNonBlocking" | "overwriteRemote";
   conflictViewMode: "default" | "unified" | "split";
   showStatusBarItem: boolean;
   showSyncRibbonButton: boolean;

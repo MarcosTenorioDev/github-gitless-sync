@@ -462,6 +462,14 @@ export default class SyncManager {
             return { type: "upload", filePath: resolution.filePath };
           },
         );
+      } else if (this.settings.conflictHandling === "askNonBlocking") {
+        // Show conflicts to the user but do not block the sync. We intentionally
+        // don't await the promise so the current sync can continue for the files
+        // that are not in conflict. Any resolution returned by the user will be
+        // handled in a subsequent sync run.
+        this.onConflicts(conflicts).catch((err) =>
+          this.logger.error("Error while resolving conflicts", err),
+        );
       } else if (this.settings.conflictHandling === "overwriteLocal") {
         // The user explicitly wants to always overwrite the local file
         // in case of conflicts so we just download the remote file to solve it
@@ -491,7 +499,9 @@ export default class SyncManager {
       ...(await this.determineSyncActions(
         remoteMetadata.files,
         this.metadataStore.data.files,
-        conflictActions.map((action) => action.filePath),
+        this.settings.conflictHandling === "ask"
+          ? conflictActions.map((action) => action.filePath)
+          : conflicts.map((c) => c.filePath),
       )),
       ...conflictActions,
     ];

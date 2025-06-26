@@ -170,7 +170,8 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
 
     const conflictHandlingOptions = {
       overwriteLocal: "Overwrite local file",
-      ask: "Ask",
+      ask: "Ask (conflicts block sync)",
+      askNonBlocking: "Ask (conflicts don't block sync)",
       overwriteRemote: "Overwrite remote file",
     };
     new Setting(containerEl)
