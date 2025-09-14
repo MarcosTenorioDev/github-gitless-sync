@@ -436,9 +436,35 @@ export default class SyncManager {
     }
 
     const blob = await this.client.getBlob({ sha: manifest.sha });
-    const remoteMetadata: Metadata = JSON.parse(
-      decodeBase64String(blob.content),
-    );
+    let remoteMetadata: Metadata;
+    
+    const manifestContent = decodeBase64String(blob.content);
+    
+    // Check for merge conflicts and try to resolve them automatically
+    if (this.hasMergeConflicts(manifestContent)) {
+      await this.logger.warn("Detected merge conflicts in remote manifest, attempting auto-resolution");
+      const resolvedContent = this.resolveMergeConflicts(manifestContent);
+      try {
+        remoteMetadata = JSON.parse(resolvedContent);
+        await this.logger.info("Successfully resolved merge conflicts in manifest");
+      } catch (err) {
+        await this.logger.error("Failed to parse manifest even after conflict resolution", {
+          content: resolvedContent.substring(0, 200) + "...",
+          error: err.message
+        });
+        throw new Error("Unable to resolve merge conflicts in manifest. Please resolve conflicts manually in the repository.");
+      }
+    } else {
+      try {
+        remoteMetadata = JSON.parse(manifestContent);
+      } catch (err) {
+        await this.logger.error("Remote manifest contains invalid JSON", {
+          content: manifestContent.substring(0, 200) + "...",
+          error: err.message
+        });
+        throw new Error("Remote manifest contains invalid JSON.");
+      }
+    }
 
     const conflicts = await this.findConflicts(remoteMetadata.files);
 
@@ -1139,6 +1165,8 @@ export default class SyncManager {
     const notice = new Notice("Force pulling from remote...");
     this.syncing = true;
     try {
+      // Create backup before force pull
+      await this.createBackup();
       await this.forcePullImpl();
       new Notice("Force pull successful", 5000);
     } catch (err) {
@@ -1166,9 +1194,35 @@ export default class SyncManager {
 
     // Get the remote metadata
     const blob = await this.client.getBlob({ sha: manifest.sha });
-    const remoteMetadata: Metadata = JSON.parse(
-      decodeBase64String(blob.content),
-    );
+    let remoteMetadata: Metadata;
+    
+    const manifestContent = decodeBase64String(blob.content);
+    
+    // Check for merge conflicts and try to resolve them automatically
+    if (this.hasMergeConflicts(manifestContent)) {
+      await this.logger.warn("Detected merge conflicts in remote manifest, attempting auto-resolution");
+      const resolvedContent = this.resolveMergeConflicts(manifestContent);
+      try {
+        remoteMetadata = JSON.parse(resolvedContent);
+        await this.logger.info("Successfully resolved merge conflicts in manifest");
+      } catch (err) {
+        await this.logger.error("Failed to parse manifest even after conflict resolution", {
+          content: resolvedContent.substring(0, 200) + "...",
+          error: err.message
+        });
+        throw new Error("Unable to resolve merge conflicts in manifest. Please resolve conflicts manually in the repository.");
+      }
+    } else {
+      try {
+        remoteMetadata = JSON.parse(manifestContent);
+      } catch (err) {
+        await this.logger.error("Remote manifest contains invalid JSON", {
+          content: manifestContent.substring(0, 200) + "...",
+          error: err.message
+        });
+        throw new Error("Remote manifest contains invalid JSON.");
+      }
+    }
 
     await this.logger.info("Force pull: Downloading repository as ZIP");
     
@@ -1218,7 +1272,8 @@ export default class SyncManager {
       }
 
       if (targetPath === `${this.vault.configDir}/${LOG_FILE_NAME}`) {
-        // We don't want to download the log file
+        // We don't want to download the log file, but we should clean it if it has conflicts
+        await this.cleanLogFileIfConflicted();
         continue;
       }
 
@@ -1316,6 +1371,130 @@ export default class SyncManager {
 
     // Remove empty folders (except root and config if not syncing)
     await this.removeEmptyFolders();
+  }
+
+  /**
+   * Creates a backup of critical files before force pull operations.
+   */
+  private async createBackup() {
+    await this.logger.info("Creating backup before force pull");
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupDir = normalizePath(`${this.vault.configDir}/backups/${timestamp}`);
+    
+    try {
+      await this.vault.adapter.mkdir(backupDir);
+      
+      // Backup manifest file
+      const manifestPath = normalizePath(`${this.vault.configDir}/${MANIFEST_FILE_NAME}`);
+      if (await this.vault.adapter.exists(manifestPath)) {
+        const manifestContent = await this.vault.adapter.read(manifestPath);
+        await this.vault.adapter.write(
+          normalizePath(`${backupDir}/${MANIFEST_FILE_NAME}`),
+          manifestContent
+        );
+      }
+      
+      // Backup log file
+      const logPath = normalizePath(`${this.vault.configDir}/${LOG_FILE_NAME}`);
+      if (await this.vault.adapter.exists(logPath)) {
+        const logContent = await this.vault.adapter.read(logPath);
+        await this.vault.adapter.write(
+          normalizePath(`${backupDir}/${LOG_FILE_NAME}`),
+          logContent
+        );
+      }
+      
+      await this.logger.info("Backup created successfully", { backupDir });
+    } catch (err) {
+      await this.logger.warn("Could not create backup", { error: err.message });
+      // Don't fail the operation if backup fails
+    }
+  }
+
+  /**
+   * Cleans the log file if it contains merge conflicts.
+   */
+  private async cleanLogFileIfConflicted() {
+    const logPath = normalizePath(`${this.vault.configDir}/${LOG_FILE_NAME}`);
+    if (await this.vault.adapter.exists(logPath)) {
+      try {
+        const logContent = await this.vault.adapter.read(logPath);
+        if (this.hasMergeConflicts(logContent)) {
+          await this.logger.warn("Detected merge conflicts in log file, cleaning it");
+          // Create a clean log file with just a header
+          const cleanContent = `# GitHub Sync Log\n# This log was cleaned due to merge conflicts\n\n`;
+          await this.vault.adapter.write(logPath, cleanContent);
+          await this.logger.info("Cleaned conflicted log file");
+        }
+      } catch (err) {
+        await this.logger.warn("Could not clean log file", { error: err.message });
+      }
+    }
+  }
+
+  /**
+   * Checks if content contains Git merge conflict markers.
+   */
+  private hasMergeConflicts(content: string): boolean {
+    return content.includes('<<<<<<< HEAD') || 
+           content.includes('=======') || 
+           content.includes('>>>>>>> ');
+  }
+
+  /**
+   * Attempts to resolve merge conflicts by choosing the most recent version.
+   * For manifest files, we prefer the remote version as it's more authoritative.
+   */
+  private resolveMergeConflicts(content: string): string {
+    const lines = content.split('\n');
+    let resolvedLines: string[] = [];
+    let inConflict = false;
+    let conflictBuffer: string[] = [];
+    let remoteBuffer: string[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      if (line.trim().startsWith('<<<<<<< HEAD')) {
+        inConflict = true;
+        conflictBuffer = [];
+        remoteBuffer = [];
+        continue;
+      }
+
+      if (line.trim().startsWith('=======')) {
+        // Switch to remote buffer
+        continue;
+      }
+
+      if (line.trim().startsWith('>>>>>>> ')) {
+        inConflict = false;
+        // For manifest files, prefer the remote version (after =======)
+        // If remote buffer is empty or invalid, fall back to local
+        if (remoteBuffer.length > 0) {
+          resolvedLines.push(...remoteBuffer);
+        } else {
+          resolvedLines.push(...conflictBuffer);
+        }
+        conflictBuffer = [];
+        remoteBuffer = [];
+        continue;
+      }
+
+      if (inConflict) {
+        if (remoteBuffer.length === 0) {
+          // We're in the local section (before =======)
+          conflictBuffer.push(line);
+        } else {
+          // We're in the remote section (after =======)
+          remoteBuffer.push(line);
+        }
+      } else {
+        resolvedLines.push(line);
+      }
+    }
+
+    return resolvedLines.join('\n');
   }
 
   /**
