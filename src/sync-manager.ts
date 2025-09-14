@@ -1125,4 +1125,239 @@ export default class SyncManager {
     this.metadataStore.reset();
     await this.metadataStore.save();
   }
+
+  /**
+   * Forces a pull from the remote repository, overwriting all local files.
+   * This is equivalent to git pull --force and will discard all local changes.
+   */
+  async forcePull() {
+    if (this.syncing) {
+      this.logger.info("Force pull already in progress");
+      return;
+    }
+
+    const notice = new Notice("Force pulling from remote...");
+    this.syncing = true;
+    try {
+      await this.forcePullImpl();
+      new Notice("Force pull successful", 5000);
+    } catch (err) {
+      new Notice(`Error during force pull. ${err}`);
+      throw err;
+    } finally {
+      this.syncing = false;
+      notice.hide();
+    }
+  }
+
+  private async forcePullImpl() {
+    await this.logger.info("Starting force pull");
+    
+    // Get the current repository content
+    const { files, sha: treeSha } = await this.client.getRepoContent({
+      retry: true,
+    });
+
+    const manifest = files[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`];
+    if (manifest === undefined) {
+      await this.logger.error("Remote manifest is missing");
+      throw new Error("Remote manifest is missing");
+    }
+
+    // Get the remote metadata
+    const blob = await this.client.getBlob({ sha: manifest.sha });
+    const remoteMetadata: Metadata = JSON.parse(
+      decodeBase64String(blob.content),
+    );
+
+    await this.logger.info("Force pull: Downloading repository as ZIP");
+    
+    // Download the entire repository as ZIP and extract it
+    const zipBuffer = await this.client.downloadRepositoryArchive();
+    const zipBlob = new Blob([zipBuffer]);
+    const reader = new ZipReader(new BlobReader(zipBlob));
+    const entries = await reader.getEntries();
+
+    await this.logger.info("Force pull: Extracting files from ZIP", {
+      length: entries.length,
+    });
+
+    // Clear all existing files in the vault (except config dir if not syncing)
+    await this.clearVaultFiles();
+
+    // Process entries sequentially to avoid loading many files in memory at once
+    for (const entry of entries) {
+      // All repo ZIPs contain a root directory that contains all the content
+      // of that repo, we need to ignore that directory so we strip the first
+      // folder segment from the path
+      const pathParts = entry.filename.split("/");
+      const targetPath =
+        pathParts.length > 1 ? pathParts.slice(1).join("/") : entry.filename;
+
+      if (targetPath === "") {
+        // Must be the root folder, skip it.
+        continue;
+      }
+
+      if (
+        !this.settings.syncConfigDir &&
+        targetPath.startsWith(this.vault.configDir) &&
+        targetPath !== `${this.vault.configDir}/${MANIFEST_FILE_NAME}`
+      ) {
+        await this.logger.info("Force pull: Skipped config", { targetPath });
+        continue;
+      }
+
+      if (entry.directory) {
+        const normalizedPath = normalizePath(targetPath);
+        await this.vault.adapter.mkdir(normalizedPath);
+        await this.logger.info("Force pull: Created directory", {
+          normalizedPath,
+        });
+        continue;
+      }
+
+      if (targetPath === `${this.vault.configDir}/${LOG_FILE_NAME}`) {
+        // We don't want to download the log file
+        continue;
+      }
+
+      if (targetPath.split("/").last()?.startsWith(".")) {
+        // We must skip hidden files
+        await this.logger.info("Force pull: Skipping hidden file", targetPath);
+        continue;
+      }
+
+      const writer = new Uint8ArrayWriter();
+      await entry.getData!(writer);
+      const data = await writer.getData();
+      const dir = targetPath.split("/").splice(0, -1).join("/");
+      if (dir !== "") {
+        const normalizedDir = normalizePath(dir);
+        await this.vault.adapter.mkdir(normalizedDir);
+        await this.logger.info("Force pull: Created directory", {
+          normalizedDir,
+        });
+      }
+
+      const normalizedPath = normalizePath(targetPath);
+      await this.vault.adapter.writeBinary(normalizedPath, data.buffer);
+      await this.logger.info("Force pull: Written file", {
+        normalizedPath,
+      });
+    }
+
+    await this.logger.info("Force pull: Extracted zip");
+
+    // Update the metadata store with remote metadata
+    this.metadataStore.data = remoteMetadata;
+    this.metadataStore.data.lastSync = Date.now();
+
+    // Update all file metadata to reflect the current state
+    Object.keys(this.metadataStore.data.files).forEach((filePath) => {
+      if (this.metadataStore.data.files[filePath]) {
+        this.metadataStore.data.files[filePath].dirty = false;
+        this.metadataStore.data.files[filePath].justDownloaded = true;
+        this.metadataStore.data.files[filePath].lastModified = Date.now();
+        this.metadataStore.data.files[filePath].deleted = false;
+        delete this.metadataStore.data.files[filePath].deletedAt;
+      }
+    });
+
+    await this.metadataStore.save();
+    await this.logger.info("Force pull completed successfully");
+  }
+
+  /**
+   * Clears all files from the vault, respecting syncConfigDir setting.
+   */
+  private async clearVaultFiles() {
+    await this.logger.info("Force pull: Clearing vault files");
+    
+    let files = [];
+    let folders = [this.vault.getRoot().path];
+    
+    // Collect all files and folders
+    while (folders.length > 0) {
+      const folder = folders.pop();
+      if (folder === undefined) {
+        continue;
+      }
+      
+      if (!this.settings.syncConfigDir && folder === this.vault.configDir) {
+        await this.logger.info("Force pull: Skipping config dir");
+        continue;
+      }
+      
+      const res = await this.vault.adapter.list(folder);
+      files.push(...res.files);
+      folders.push(...res.folders);
+    }
+
+    // Remove all files
+    for (const filePath of files) {
+      if (filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`) {
+        // Keep the manifest file as we need it for metadata
+        continue;
+      }
+      
+      if (!this.settings.syncConfigDir && filePath.startsWith(this.vault.configDir)) {
+        // Skip config files if not syncing config
+        continue;
+      }
+      
+      try {
+        await this.vault.adapter.remove(normalizePath(filePath));
+        await this.logger.info("Force pull: Removed file", { filePath });
+      } catch (err) {
+        await this.logger.warn("Force pull: Could not remove file", { filePath, err });
+      }
+    }
+
+    // Remove empty folders (except root and config if not syncing)
+    await this.removeEmptyFolders();
+  }
+
+  /**
+   * Removes empty folders from the vault.
+   */
+  private async removeEmptyFolders() {
+    let folders = [];
+    let currentFolders = [this.vault.getRoot().path];
+    
+    // Collect all folders
+    while (currentFolders.length > 0) {
+      const folder = currentFolders.pop();
+      if (folder === undefined) {
+        continue;
+      }
+      
+      if (!this.settings.syncConfigDir && folder === this.vault.configDir) {
+        continue;
+      }
+      
+      const res = await this.vault.adapter.list(folder);
+      folders.push(...res.folders);
+      currentFolders.push(...res.folders);
+    }
+
+    // Remove folders in reverse order (deepest first)
+    folders.reverse();
+    
+    for (const folder of folders) {
+      if (!this.settings.syncConfigDir && folder === this.vault.configDir) {
+        continue;
+      }
+      
+      try {
+        const res = await this.vault.adapter.list(folder);
+        if (res.files.length === 0 && res.folders.length === 0) {
+          await this.vault.adapter.rmdir(normalizePath(folder), false);
+          await this.logger.info("Force pull: Removed empty folder", { folder });
+        }
+      } catch (err) {
+        await this.logger.warn("Force pull: Could not remove folder", { folder, err });
+      }
+    }
+  }
 }

@@ -237,6 +237,23 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
           });
       });
 
+    new Setting(containerEl)
+      .setName("Show force pull button")
+      .setDesc("Displays a ribbon button to force pull from remote (overwrites local files)")
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.showForcePullRibbonButton)
+          .onChange((value) => {
+            this.plugin.settings.showForcePullRibbonButton = value;
+            this.plugin.saveSettings();
+            if (value) {
+              this.plugin.showForcePullRibbonIcon();
+            } else {
+              this.plugin.hideForcePullRibbonIcon();
+            }
+          });
+      });
+
     const diffModeOptions = {
       default: "Default",
       unified: "Unified",

@@ -22,6 +22,7 @@ export default class GitHubSyncPlugin extends Plugin {
   statusBarItem: HTMLElement | null = null;
   syncRibbonIcon: HTMLElement | null = null;
   conflictsRibbonIcon: HTMLElement | null = null;
+  forcePullRibbonIcon: HTMLElement | null = null;
 
   activeLeafChangeListener: EventRef | null = null;
   vaultCreateListener: EventRef | null = null;
@@ -122,6 +123,10 @@ export default class GitHubSyncPlugin extends Plugin {
       if (this.settings.showSyncRibbonButton) {
         this.showSyncRibbonIcon();
       }
+
+      if (this.settings.showForcePullRibbonButton) {
+        this.showForcePullRibbonIcon();
+      }
     });
 
     this.addCommand({
@@ -138,6 +143,14 @@ export default class GitHubSyncPlugin extends Plugin {
       repeatable: false,
       icon: "refresh-cw",
       callback: this.openConflictsView.bind(this),
+    });
+
+    this.addCommand({
+      id: "force-pull",
+      name: "Force pull from GitHub (overwrites local files)",
+      repeatable: false,
+      icon: "download",
+      callback: this.forcePull.bind(this),
     });
   }
 
@@ -169,6 +182,50 @@ export default class GitHubSyncPlugin extends Plugin {
       await this.syncManager.sync();
     }
     this.updateStatusBarItem();
+  }
+
+  async forcePull() {
+    if (
+      this.settings.githubToken === "" ||
+      this.settings.githubOwner === "" ||
+      this.settings.githubRepo === "" ||
+      this.settings.githubBranch === ""
+    ) {
+      new Notice("Sync plugin not configured");
+      return;
+    }
+
+    // Show confirmation dialog before force pull
+    const { Modal, Setting } = require("obsidian");
+    const modal = new Modal(this.app);
+    modal.setTitle("Force Pull Confirmation");
+    modal.setContent(
+      "This will overwrite ALL local files with the remote repository content. " +
+      "Any local changes will be permanently lost. Are you sure you want to continue?"
+    );
+
+    new Setting(modal.contentEl)
+      .addButton((btn:any) =>
+        btn
+          .setButtonText("Force Pull")
+          .setCta()
+          .onClick(async () => {
+            modal.close();
+            try {
+              await this.syncManager.forcePull();
+              this.updateStatusBarItem();
+            } catch (err) {
+              // Error is already shown in syncManager.forcePull()
+            }
+          })
+      )
+      .addButton((btn:any) =>
+        btn.setButtonText("Cancel").onClick(() => {
+          modal.close();
+        })
+      );
+
+    modal.open();
   }
 
   async onunload() {
@@ -256,6 +313,22 @@ export default class GitHubSyncPlugin extends Plugin {
   hideConflictsRibbonIcon() {
     this.conflictsRibbonIcon?.remove();
     this.conflictsRibbonIcon = null;
+  }
+
+  showForcePullRibbonIcon() {
+    if (this.forcePullRibbonIcon) {
+      return;
+    }
+    this.forcePullRibbonIcon = this.addRibbonIcon(
+      "download",
+      "Force pull from GitHub (overwrites local files)",
+      this.forcePull.bind(this),
+    );
+  }
+
+  hideForcePullRibbonIcon() {
+    this.forcePullRibbonIcon?.remove();
+    this.forcePullRibbonIcon = null;
   }
 
   async openConflictsView() {

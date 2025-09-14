@@ -13,6 +13,7 @@ export interface GitHubSyncSettings {
   showStatusBarItem: boolean;
   showSyncRibbonButton: boolean;
   showConflictsRibbonButton: boolean;
+  showForcePullRibbonButton: boolean;
   enableLogging: boolean;
 }
 
@@ -31,5 +32,6 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   showStatusBarItem: true,
   showSyncRibbonButton: true,
   showConflictsRibbonButton: true,
+  showForcePullRibbonButton: true,
   enableLogging: false,
 };
